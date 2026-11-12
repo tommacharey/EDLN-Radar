@@ -1,0 +1,404 @@
+<title>EDLN Radar</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Space+Grotesk:wght@500;700&display=swap">
+<style>
+  /* Layout: Kopfzeile, Radar-Fläche füllt den Rest, Bedienleiste unten.
+     Bewusst nur ein dunkler Look, weil es ein Radarschirm ist. */
+  :root {
+    --bg: #060b12;
+    --panel: #0c1520;
+    --line: #1c2c3d;
+    --fg: #e6f1ff;
+    --muted: #7f9bb8;
+    --accent: #4fd1ff;
+    --warn: #ff9a4d;
+    --font-display: "Space Grotesk", "Segoe UI", system-ui, sans-serif;
+    --font-data: "JetBrains Mono", Consolas, "SF Mono", monospace;
+    color-scheme: dark;
+  }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-display);
+    display: flex;
+    flex-direction: column;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    padding-block: 12px;
+    box-sizing: border-box;
+    overflow-x: hidden;
+  }
+  header {
+    display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+    gap: 6px 16px; padding-bottom: 8px;
+  }
+  h1 { margin: 0; font-size: 1.35rem; letter-spacing: .02em; text-wrap: balance; }
+  h1 small { font-weight: 500; font-size: .8rem; color: var(--muted); margin-left: 8px; letter-spacing: .04em; }
+  #clock { font-family: var(--font-data); font-size: 1.1rem; font-variant-numeric: tabular-nums; }
+  #status {
+    display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center;
+    font-family: var(--font-data); font-size: .75rem; color: var(--muted); padding-bottom: 8px;
+  }
+  .badge {
+    padding: 2px 8px; border-radius: 4px; font-weight: 700; letter-spacing: .08em;
+    border: 1px solid var(--line); color: var(--muted);
+  }
+  .badge.live { color: #5be3a0; border-color: #1e5a43; }
+  .badge.sim { color: var(--warn); border-color: #5a3a1e; }
+  #stage { flex: 1; min-height: 240px; position: relative; min-width: 0; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  #note {
+    font-size: .75rem; color: var(--muted); line-height: 1.45; max-width: 70ch;
+    padding-top: 8px; margin: 0;
+  }
+  #note[hidden] { display: none; }
+  footer { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; padding-top: 10px; }
+  footer label { font-size: .8rem; color: var(--muted); display: inline-flex; gap: 6px; align-items: center; }
+  select, button {
+    font: inherit; font-size: .8rem; color: var(--fg); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; cursor: pointer;
+  }
+  select:hover, button:hover { border-color: var(--accent); }
+  select:focus-visible, button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  input[type=checkbox] { accent-color: var(--accent); width: 16px; height: 16px; }
+  .spacer { flex: 1; }
+  @media (max-width: 520px) { h1 { font-size: 1.15rem; } }
+</style>
+
+<header>
+  <h1>EDLN Radar <small>Mönchengladbach</small></h1>
+  <div id="clock">--:--:--</div>
+</header>
+<div id="status">
+  <span id="badge" class="badge">…</span>
+  <span id="count"></span>
+  <span id="updated"></span>
+</div>
+<div id="stage"><canvas id="c" aria-label="Radaransicht des Flugverkehrs um EDLN"></canvas></div>
+<p id="note" hidden>
+  Hier läuft eine Simulation: Diese Seite darf in ihrer Umgebung keine Live-Daten laden.
+  Die Callsigns und Werte sind erfunden. Als eigene HTML-Datei in einem normalen Browser geöffnet, zeigt dieselbe Seite echten Verkehr von adsb.lol.
+</p>
+<footer>
+  <label for="range">Radius
+    <select id="range">
+      <option value="30">30 NM</option><option value="50">50 NM</option>
+      <option value="70" selected>70 NM</option><option value="100">100 NM</option>
+      <option value="150">150 NM</option>
+    </select>
+  </label>
+  <label for="units">Einheiten
+    <select id="units"><option value="aviation" selected>ft / kt</option><option value="metric">m / km/h</option></select>
+  </label>
+  <label for="trails"><input type="checkbox" id="trails" checked> Spuren</label>
+  <label for="labels"><input type="checkbox" id="labels" checked> Beschriftung</label>
+  <label for="ground"><input type="checkbox" id="ground"> Am Boden</label>
+  <span class="spacer"></span>
+  <button id="fs" type="button">Vollbild</button>
+</footer>
+
+<script>
+(function () {
+  const CFG = { lat: 51.2300, lon: 6.5047, range: 70, interval: 8, metric: false, labels: true, trails: true, ground: false };
+  const RAD = Math.PI / 180;
+  const css = getComputedStyle(document.documentElement);
+  const C = {
+    accent: css.getPropertyValue('--accent').trim() || '#4fd1ff',
+    fg: css.getPropertyValue('--fg').trim() || '#e6f1ff',
+    muted: css.getPropertyValue('--muted').trim() || '#7f9bb8',
+    data: css.getPropertyValue('--font-data').trim() || 'monospace'
+  };
+  const AIRPORTS = [
+    ['EDDL', 51.2895, 6.7668], ['EDDK', 50.8659, 7.1427], ['EDLV', 51.6024, 6.1422],
+    ['EDLW', 51.5183, 7.6122], ['EHBK', 50.9117, 5.7701], ['EBLG', 50.6374, 5.4432],
+    ['EHEH', 51.4501, 5.3747], ['EDDG', 52.1346, 7.6848], ['EDKB', 50.7687, 7.1633],
+    ['EDLE', 51.4023, 6.9374], ['EDLA', 51.4839, 7.8996], ['EHVK', 51.6564, 5.7070],
+    ['EDKA', 50.8231, 6.1864], ['EDLP', 51.6141, 8.6163]
+  ];
+  const SOURCES = [
+    () => `https://api.adsb.lol/v2/point/${CFG.lat}/${CFG.lon}/${Math.min(250, Math.round(CFG.range))}`,
+    () => `https://api.airplanes.live/v2/point/${CFG.lat}/${CFG.lon}/${Math.min(250, Math.round(CFG.range))}`
+  ];
+
+  const $ = id => document.getElementById(id);
+  const cv = $('c'), ctx = cv.getContext('2d'), stage = $('stage');
+  let W = 0, H = 0;
+  const planes = new Map();
+  let mode = 'connecting';       // connecting | live | sim
+  let lastOk = 0, sourceName = '';
+  let simPlanes = null, simLast = 0;
+
+  // ---------- Größe ----------
+  function resize() {
+    const r = stage.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    W = Math.max(1, r.width); H = Math.max(1, r.height);
+    cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  new ResizeObserver(resize).observe(stage);
+  resize();
+
+  // ---------- Geometrie ----------
+  function toXY(lat, lon) { return { x: (lon - CFG.lon) * Math.cos(CFG.lat * RAD) * 60, y: (lat - CFG.lat) * 60 }; }
+  function toLL(x, y) { const lat = CFG.lat + y / 60; return { lat, lon: CFG.lon + x / (60 * Math.cos(lat * RAD)) }; }
+  function advance(p, dt) {
+    if (p.ground || !p.gs || p.track == null) return { lat: p.lat, lon: p.lon };
+    const d = p.gs * dt / 3600;
+    return { lat: p.lat + d * Math.cos(p.track * RAD) / 60, lon: p.lon + d * Math.sin(p.track * RAD) / (60 * Math.cos(p.lat * RAD)) };
+  }
+
+  // ---------- Live-Daten ----------
+  async function fetchLive() {
+    for (let i = 0; i < SOURCES.length; i++) {
+      try {
+        const ctl = new AbortController();
+        const to = setTimeout(() => ctl.abort(), 6000);
+        const r = await fetch(SOURCES[i](), { signal: ctl.signal, cache: 'no-store' });
+        clearTimeout(to);
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const j = await r.json();
+        sourceName = i === 0 ? 'adsb.lol' : 'airplanes.live';
+        return j.ac || j.aircraft || [];
+      } catch (e) { /* nächste Quelle */ }
+    }
+    return null;
+  }
+
+  // ---------- Simulation ----------
+  const CALLS = ['DLH4TK','EWG7XA','RYR3FQ','KLM1625','BCS1204','CFG8LA','TUI4PN','SWR204','EXS72J','UPS245','FDX5391','QTR8109','DLH9WG','EZY41KA','AUA1V','BEL7NP','VLG8812','THY1AR','WZZ4021','CLX778'];
+  const TYPES = ['A320','A21N','B738','A319','E190','A333','B77L','B748','A20N','BCS3'];
+  function spawn(i, edge) {
+    const R = CFG.range;
+    let x, y, track;
+    if (edge) {
+      const a = Math.random() * 2 * Math.PI;
+      x = Math.sin(a) * R * 0.98; y = Math.cos(a) * R * 0.98;
+      track = (a * 180 / Math.PI + 180 + (Math.random() - 0.5) * 70 + 360) % 360;
+    } else {
+      const a = Math.random() * 2 * Math.PI, r = Math.sqrt(Math.random()) * R * 0.95;
+      x = Math.sin(a) * r; y = Math.cos(a) * r; track = Math.random() * 360;
+    }
+    const low = Math.random() < 0.35;
+    return {
+      hex: 'sim' + i, call: CALLS[i % CALLS.length], type: TYPES[i % TYPES.length],
+      x, y, track,
+      gs: low ? 150 + Math.random() * 90 : 340 + Math.random() * 170,
+      alt: low ? 1800 + Math.random() * 6000 : 24000 + Math.random() * 15000,
+      rate: low ? (Math.random() < 0.5 ? -900 : 1600) : 0
+    };
+  }
+  function stepSim() {
+    const now = performance.now();
+    if (!simPlanes) { simPlanes = []; for (let i = 0; i < 18; i++) simPlanes.push(spawn(i, false)); simLast = now; }
+    const dt = Math.min(5, (now - simLast) / 1000); simLast = now;
+    const out = [];
+    simPlanes.forEach((s, i) => {
+      const d = s.gs * dt / 3600;
+      s.x += Math.sin(s.track * RAD) * d; s.y += Math.cos(s.track * RAD) * d;
+      s.alt = Math.min(40000, Math.max(1500, s.alt + s.rate * dt / 60));
+      if (Math.hypot(s.x, s.y) > CFG.range * 1.04) { simPlanes[i] = spawn(i, true); s = simPlanes[i]; }
+      const ll = toLL(s.x, s.y);
+      out.push({ hex: s.hex, flight: s.call, t: s.type, lat: ll.lat, lon: ll.lon, alt_baro: Math.round(s.alt), gs: s.gs, track: s.track, baro_rate: s.rate });
+    });
+    return out;
+  }
+
+  // ---------- Verarbeiten ----------
+  function ingest(list) {
+    const now = performance.now();
+    for (const a of list) {
+      if (typeof a.lat !== 'number' || typeof a.lon !== 'number') continue;
+      const ground = a.alt_baro === 'ground';
+      if (ground && !CFG.ground) { planes.delete(a.hex); continue; }
+      const pos = toXY(a.lat, a.lon);
+      if (Math.hypot(pos.x, pos.y) > CFG.range * 1.03) continue;
+      let p = planes.get(a.hex);
+      if (!p) { p = { hex: a.hex, trail: [] }; planes.set(a.hex, p); }
+      p.call = (a.flight || '').trim() || a.r || String(a.hex).toUpperCase();
+      p.lat = a.lat; p.lon = a.lon; p.ground = ground;
+      p.alt = ground ? 0 : (typeof a.alt_baro === 'number' ? a.alt_baro : (a.alt_geom || 0));
+      p.gs = a.gs || 0;
+      p.track = a.track != null ? a.track : (a.true_heading != null ? a.true_heading : null);
+      p.rate = a.baro_rate || a.geom_rate || 0;
+      p.t0 = now - (a.seen_pos || 0) * 1000;
+      p.seen = now;
+      const last = p.trail[p.trail.length - 1];
+      if (!last || Math.hypot(pos.x - last[0], pos.y - last[1]) > 0.4) {
+        p.trail.push([pos.x, pos.y]);
+        if (p.trail.length > 60) p.trail.shift();
+      }
+    }
+    for (const [k, p] of planes) if (now - p.seen > 40000) planes.delete(k);
+  }
+
+  let liveRetryAt = 0;
+  async function tick() {
+    let data = null;
+    if (mode !== 'sim' || Date.now() >= liveRetryAt) data = await fetchLive();
+    if (data) {
+      if (mode !== 'live') { planes.clear(); mode = 'live'; }
+      lastOk = Date.now(); ingest(data);
+    } else {
+      if (mode !== 'sim') { planes.clear(); mode = 'sim'; }
+      liveRetryAt = Date.now() + 60000;
+      lastOk = Date.now(); ingest(stepSim());
+    }
+    updateStatus();
+    setTimeout(tick, mode === 'sim' ? 2000 : Math.max(4, CFG.interval) * 1000);
+  }
+
+  // ---------- Formatierung ----------
+  const pad = (n, l) => String(n).padStart(l, '0');
+  function fmtAlt(p) {
+    if (p.ground) return 'GND';
+    if (CFG.metric) return Math.round(p.alt * 0.3048 / 10) * 10 + ' m';
+    return p.alt >= 5000 ? 'FL' + pad(Math.round(p.alt / 100), 3) : Math.round(p.alt / 50) * 50 + ' ft';
+  }
+  function fmtSpd(p) { return CFG.metric ? Math.round(p.gs * 1.852) + ' km/h' : Math.round(p.gs) + ' kt'; }
+  function altColor(alt) { const t = Math.min(Math.max(alt, 0) / 40000, 1); return `hsl(${Math.round(25 + 175 * t)},90%,62%)`; }
+
+  function updateStatus() {
+    const b = $('badge');
+    b.className = 'badge ' + (mode === 'live' ? 'live' : mode === 'sim' ? 'sim' : '');
+    b.textContent = mode === 'live' ? 'LIVE' : mode === 'sim' ? 'SIMULATION' : 'VERBINDE …';
+    $('count').textContent = `${planes.size} Flugzeuge · ${CFG.range} NM um EDLN` + (mode === 'live' ? ` · Quelle ${sourceName}` : '');
+    $('updated').textContent = lastOk ? 'Stand ' + new Date(lastOk).toLocaleTimeString('de-DE') : '';
+    $('note').hidden = mode !== 'sim';
+  }
+
+  // ---------- Zeichnen ----------
+  const SHAPE = [[0,-10],[1.8,-4],[10,1],[10,3.2],[1.8,1.4],[1.4,7],[4.4,9],[4.4,10.5],[0,9.4]];
+  function drawPlane(x, y, track, color, sc) {
+    ctx.save(); ctx.translate(x, y); ctx.rotate((track || 0) * RAD); ctx.scale(sc, sc);
+    ctx.beginPath();
+    SHAPE.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]));
+    for (let i = SHAPE.length - 1; i >= 1; i--) ctx.lineTo(-SHAPE[i][0], SHAPE[i][1]);
+    ctx.closePath();
+    ctx.fillStyle = color; ctx.strokeStyle = 'rgba(0,0,0,.7)'; ctx.lineWidth = 1;
+    ctx.shadowColor = color; ctx.shadowBlur = 8; ctx.fill(); ctx.shadowBlur = 0; ctx.stroke();
+    ctx.restore();
+  }
+  function text(str, x, y, font, color, align) {
+    ctx.font = font; ctx.textAlign = align || 'left';
+    ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(3,8,14,.85)'; ctx.strokeText(str, x, y);
+    ctx.fillStyle = color; ctx.fillText(str, x, y);
+  }
+
+  function frame() {
+    const now = performance.now();
+    const u = Math.max(0.75, Math.min(1.3, Math.min(W, H) / 800));
+    const margin = 30 * u + 8;
+    const R = Math.min(W, H) / 2 - margin;
+    const cx = W / 2, cy = H / 2;
+    if (R < 40) return;
+    const S = R / CFG.range;
+    const mono = n => `${n * u}px ${C.data}`;
+
+    ctx.clearRect(0, 0, W, H);
+
+    const step = CFG.range <= 40 ? 10 : (CFG.range <= 100 ? 20 : 50);
+    ctx.lineWidth = 1;
+    for (let r = step; r <= CFG.range + 0.01; r += step) {
+      ctx.strokeStyle = 'rgba(120,170,210,.16)';
+      ctx.beginPath(); ctx.arc(cx, cy, r * S, 0, 7); ctx.stroke();
+      text(r + ' NM', cx + 4, cy - r * S - 4, mono(10), 'rgba(150,190,225,.45)');
+    }
+    ctx.strokeStyle = 'rgba(120,170,210,.35)'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(cx, cy, CFG.range * S, 0, 7); ctx.stroke();
+
+    ctx.strokeStyle = 'rgba(120,170,210,.12)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(cx - R, cy); ctx.lineTo(cx + R, cy); ctx.moveTo(cx, cy - R); ctx.lineTo(cx, cy + R); ctx.stroke();
+    for (let a = 0; a < 360; a += 10) {
+      const big = a % 30 === 0, r2 = R + (big ? 9 : 5) * u;
+      ctx.strokeStyle = 'rgba(150,190,225,.35)';
+      ctx.beginPath();
+      ctx.moveTo(cx + Math.sin(a * RAD) * R, cy - Math.cos(a * RAD) * R);
+      ctx.lineTo(cx + Math.sin(a * RAD) * r2, cy - Math.cos(a * RAD) * r2);
+      ctx.stroke();
+      if (big) text(a === 0 ? 'N' : String(a), cx + Math.sin(a * RAD) * (R + 20 * u),
+        cy - Math.cos(a * RAD) * (R + 20 * u) + 4 * u, mono(10), a === 0 ? C.accent : 'rgba(150,190,225,.55)', 'center');
+    }
+
+    for (const [icao, la, lo] of AIRPORTS) {
+      const p = toXY(la, lo);
+      if (Math.hypot(p.x, p.y) > CFG.range) continue;
+      const x = cx + p.x * S, y = cy - p.y * S;
+      ctx.strokeStyle = 'rgba(160,200,230,.55)'; ctx.lineWidth = 1; ctx.strokeRect(x - 3, y - 3, 6, 6);
+      text(icao, x + 7, y + 4, mono(10), 'rgba(160,200,230,.55)');
+    }
+    ctx.fillStyle = C.accent; ctx.shadowColor = C.accent; ctx.shadowBlur = 12;
+    ctx.beginPath(); ctx.arc(cx, cy, 4, 0, 7); ctx.fill(); ctx.shadowBlur = 0;
+    text('EDLN', cx + 9, cy + 4, `bold ${12 * u}px ${C.data}`, C.accent);
+
+    const list = [];
+    for (const p of planes.values()) {
+      const pos = advance(p, (now - p.t0) / 1000);
+      const q = toXY(pos.lat, pos.lon);
+      list.push({ p, x: cx + q.x * S, y: cy - q.y * S });
+    }
+    list.sort((a, b) => a.p.alt - b.p.alt);
+
+    if (CFG.trails) {
+      for (const { p, x, y } of list) {
+        if (p.trail.length < 2) continue;
+        const col = altColor(p.alt);
+        ctx.lineWidth = 1.5;
+        for (let i = 1; i < p.trail.length; i++) {
+          ctx.strokeStyle = col; ctx.globalAlpha = 0.5 * i / p.trail.length;
+          ctx.beginPath();
+          ctx.moveTo(cx + p.trail[i - 1][0] * S, cy - p.trail[i - 1][1] * S);
+          ctx.lineTo(cx + p.trail[i][0] * S, cy - p.trail[i][1] * S);
+          ctx.stroke();
+        }
+        const l = p.trail[p.trail.length - 1];
+        ctx.globalAlpha = 0.5; ctx.strokeStyle = col;
+        ctx.beginPath(); ctx.moveTo(cx + l[0] * S, cy - l[1] * S); ctx.lineTo(x, y); ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    for (const { p, x, y } of list) {
+      const col = altColor(p.alt);
+      drawPlane(x, y, p.track, col, 0.8 * u);
+      if (CFG.labels) {
+        const arrow = p.rate > 300 ? ' ▲' : (p.rate < -300 ? ' ▼' : '');
+        text(p.call, x + 12 * u, y - 3 * u, `bold ${12 * u}px ${C.data}`, C.fg);
+        text(`${fmtAlt(p)}${arrow} · ${fmtSpd(p)}`, x + 12 * u, y + 10 * u, mono(10.5), col);
+      }
+    }
+  }
+
+  let lastDraw = 0;
+  function loop(ts) {
+    requestAnimationFrame(loop);
+    if (ts - lastDraw < 33) return;
+    lastDraw = ts;
+    frame();
+    $('clock').textContent = new Date().toLocaleTimeString('de-DE');
+  }
+
+  // ---------- Bedienung ----------
+  $('range').addEventListener('change', e => { CFG.range = +e.target.value; planes.clear(); simPlanes = null; updateStatus(); });
+  $('units').addEventListener('change', e => { CFG.metric = e.target.value === 'metric'; });
+  $('trails').addEventListener('change', e => { CFG.trails = e.target.checked; });
+  $('labels').addEventListener('change', e => { CFG.labels = e.target.checked; });
+  $('ground').addEventListener('change', e => {
+    CFG.ground = e.target.checked;
+    if (!CFG.ground) for (const [k, p] of planes) if (p.ground) planes.delete(k);
+  });
+  $('fs').addEventListener('click', () => {
+    try {
+      if (document.fullscreenElement) { document.exitFullscreen(); }
+      else { const r = document.documentElement.requestFullscreen(); if (r && r.catch) r.catch(() => {}); }
+    } catch (e) {}
+  });
+  if (!document.documentElement.requestFullscreen) $('fs').hidden = true;
+
+  updateStatus();
+  tick();
+  requestAnimationFrame(loop);
+})();
+</script>
